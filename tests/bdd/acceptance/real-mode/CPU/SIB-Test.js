@@ -76,6 +76,26 @@ EOS
                     done(exception);
                 });
             });
+
+            it("should be able to perform a complex calculation using LEA with a displacement with negative term", function (done) {
+                var assembly = util.heredoc(function (/*<<<EOS
+org 0x100
+
+[BITS 16]
+mov ebx, 10
+mov esi, 20
+lea dx, [ebx * 8 + esi - 22]
+hlt
+EOS
+*/) {});
+
+                testSystem.execute(assembly).done(function () {
+                    expect(system.getCPURegisters().dx.get()).to.equal(10 * 8 + 20 - 22);
+                    done();
+                }).fail(function (exception) {
+                    done(exception);
+                });
+            });
         });
     });
 });

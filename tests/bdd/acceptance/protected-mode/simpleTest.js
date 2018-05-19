@@ -42,14 +42,6 @@ define([
                 var assembly = util.heredoc(function (/*<<<EOS
 org 0x100
 
-;; Real mode startup
-[BITS 16]
-xor ax, ax
-mov ds, ax
-mov es, ax
-mov ss, ax
-mov sp, 0x100
-
 ;; Set up ready to enter protected mode
 cli
 lgdt [gdtr]

@@ -19,12 +19,14 @@ define([
 
     describe("CPU 'popf' (pop flags or eflags) instruction", function () {
         /*jshint bitwise: false */
-        var system,
+        var registers,
+            system,
             testSystem;
 
         beforeEach(function (done) {
             testSystem = new TestSystem();
             system = testSystem.getSystem();
+            registers = system.getCPURegisters();
 
             testSystem.init().done(function () {
                 done();
@@ -33,6 +35,7 @@ define([
 
         afterEach(function () {
             system.stop();
+            registers = null;
             system = null;
             testSystem = null;
         });
@@ -50,8 +53,8 @@ define([
                     size: 2
                 }],
                 expectedRegisters: {
-                    flags: (0xabcd & 0x0fd5) | 2,
-                    eflags: (0x0000abcd & 0xffff0fd5) | 2 // Ensure high word of eflags is left untouched
+                    flags: 0xabcd,
+                    eflags: 0x0000abcd // Ensure high word of eflags is left untouched
                 }
             },
             "16-bit pop into flags of 0x0fd5": {
@@ -66,8 +69,24 @@ define([
                     size: 2
                 }],
                 expectedRegisters: {
-                    flags: 0x0fd5 | 2,     // Bit 1 is reserved, always set
-                    eflags: 0x00000fd5 | 2 // Ensure high word of eflags is left untouched
+                    flags: 0x0fd5,
+                    eflags: 0x00000fd5 // Ensure high word of eflags is left untouched
+                }
+            },
+            "16-bit pop into flags of 0xf000": {
+                is32BitCodeSegment: false,
+                registers: {
+                    ss: 0x300,
+                    sp: 0x200
+                },
+                memory: [{
+                    to: (0x300 << 4) + 0x200,
+                    data: 0xf000,
+                    size: 2
+                }],
+                expectedRegisters: {
+                    flags: 0xf000,
+                    eflags: 0x0000f000 // Ensure high word of eflags is left untouched
                 }
             },
             "32-bit pop into eflags": {
@@ -82,8 +101,8 @@ define([
                     size: 4
                 }],
                 expectedRegisters: {
-                    flags: (0xbcde & 0x7fd5) | 2, // Bit 1 is reserved, always set
-                    eflags: (0x4321bcde & 0x00037fd5) | 2
+                    flags: 0xbcde,
+                    eflags: 0x4321bcde
                 }
             }
         }, function (scenario, description) {
@@ -91,8 +110,6 @@ define([
 
             describe("when code segment is " + (is32BitCodeSegment ? 32 : 16) + "-bit", function () {
                 describe(description, function () {
-                    var registers;
-
                     beforeEach(function (done) {
                         var assembly = util.heredoc(function (/*<<<EOS
 org 0x100
@@ -102,7 +119,6 @@ popf
 hlt
 EOS
 */) {}, {operand1: scenario.operand1, operand2: scenario.operand2, bits: is32BitCodeSegment ? 32 : 16});
-                        registers = system.getCPURegisters();
 
                         testSystem.on("pre-run", function () {
                             registers.cs.set32BitMode(is32BitCodeSegment);

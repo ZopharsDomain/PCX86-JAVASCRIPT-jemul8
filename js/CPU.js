@@ -7,9 +7,11 @@
  * http://jemul8.com/MIT-LICENSE.txt
  */
 
-/*global clearTimeout, define, setTimeout */
+/*global clearImmediate, define, setImmediate */
 define([
     "js/util",
+    "js/CPU/CPUException",
+    "js/CPU/CPUHalt",
     "js/EventEmitter",
     "js/core/classes/cpu/execute",
     "js/core/classes/cpu/global_table_register",
@@ -21,9 +23,12 @@ define([
     "js/core/classes/cpu/unlazy_flag",
     "js/Pin",
     "js/Promise",
-    "js/Register"
+    "js/Register",
+    "vendor/setImmediate/setImmediate"
 ], function (
     util,
+    CPUException,
+    CPUHalt,
     EventEmitter,
     LegacyExecute,
     LegacyGlobalTableRegister,
@@ -39,22 +44,76 @@ define([
 ) {
     "use strict";
 
-    var DIVIDE_ERROR = 0;
+    var BRANCHING_INSTRUCTIONS = (function (names) {
+            var hash = {};
+
+            util.each(names, function (name) {
+                hash[name] = true;
+            });
+
+            return hash;
+        }([
+            "CALLF",
+            "CALLN",
+            "HLT",
+            //"IN",
+            //"INS",
+            "INT",
+            "INTO",
+            "IRET",
+            "JO",
+            "JNO",
+            "JB",
+            "JNB",
+            "JE",
+            "JNE",
+            "JBE",
+            "JNBE",
+            "JS",
+            "JNS",
+            "JP",
+            "JNP",
+            "JL",
+            "JNL",
+            "JLE",
+            "JNLE",
+            "JCXZ",
+            "JMPF",
+            "JMPN",
+            "JMPS",
+            "LOOP",
+            "LOOPE",
+            "LOOPNE",
+            //"OUT",
+            //"OUTS",
+            "RETF",
+            "RETF_P",
+            "RETN",
+            "RETN_P"
+        ])),
+        DIVIDE_ERROR = 0,
+        INSN_LIST = [];
 
     function CPU(system, io, memory, decoder, clock, options) {
-        var registers = {};
+        /*jshint bitwise: false */
+        var index,
+            registers = {};
 
         EventEmitter.call(this);
 
         this.clock = clock;
+        this.currentInstructionOffset = 0;
         this.decoder = decoder;
         this.intr = new Pin();
         this.io = io;
         this.memory = memory;
         this.options = options;
+        this.pages = [];
         this.registers = registers;
         this.running = false;
         this.stats = {
+            fragmentHitsPerSecond: 0,
+            fragmentMissesPerSecond: 0,
             instructionsPerSecond: 0,
             microsecondsLastUpdate: 0,
             yieldsPerSecond: 0
@@ -178,7 +237,10 @@ define([
         // Local Descriptor Table Register
         registers.ldtr = new LegacyLocalTableRegister("LDTR", 4);
         // Task Register
-        registers.tr = new LegacySegmentRegister("TR", 4);
+        registers.tr = new LegacySegmentRegister("TR", 2);
+
+        // Task Descriptor Register - a fake segment register used for loading TSS or Task Gate descriptors
+        registers.tdr = new LegacySegmentRegister("TDR", 2);
 
         // Control Register 0
         registers.cr0 = new LegacyLazyFlagRegister("CR0", 4);
@@ -285,6 +347,32 @@ define([
         registers.tr7 = new Register(4, "TR7");
         /* ======= /Test Registers ======= */
 
+        registers.cr3.set = function (value) {
+            memory.setPageDirectoryAddress(value);
+
+            Register.prototype.set.call(this, value);
+        };
+
+        registers.pg.clear = function () {
+            memory.disablePaging();
+
+            LegacyUnlazyFlag.prototype.clear.call(this);
+        };
+        registers.pg.set = function () {
+            memory.enablePaging();
+
+            LegacyUnlazyFlag.prototype.set.call(this);
+        };
+        registers.pg.setBin = function (set) {
+            if (set) {
+                memory.enablePaging();
+            } else {
+                memory.disablePaging();
+            }
+
+            LegacyUnlazyFlag.prototype.setBin.call(this, set);
+        };
+
         this.legacyCPU = (function (cpu) {
             var legacyCPU = {
                     ES: registers.es,
@@ -329,11 +417,17 @@ define([
                     CR3: registers.cr3,
                     CR4: registers.cr4,
 
+                    NT: registers.nt,
+                    TS: registers.ts,
+
                     MSW: registers.msw,
 
                     GDTR: registers.gdtr,
                     IDTR: registers.idtr,
                     LDTR: registers.ldtr,
+
+                    TR: registers.tr,
+                    TDR: registers.tdr,
 
                     EFLAGS: registers.eflags,
                     FLAGS: registers.flags,
@@ -350,8 +444,8 @@ define([
                     PE: registers.pe,
                     VM: registers.vm,
 
-                    exception: function (vector) {
-                        cpu.exception(vector);
+                    exception: function (vector, code) {
+                        cpu.exception(vector, code);
                     },
 
                     fetchRawDescriptor: function (selector, exceptionType) {
@@ -372,36 +466,15 @@ define([
 
                     // Return from Interrupt Service Routine (ISR)
                     interruptReturn: function (is32) {
-                        /*jshint bitwise: false */
-                        var eflags,
-                            flags,
-                            registers = cpu.registers;
-
-                        if (!is32) {
-                            // Set all of EIP to zero-out high word
-                            registers.eip.set(cpu.popStack(2));
-                            registers.cs.set(cpu.popStack(2)); // 16-bit pop
-
-                            // FIXME: Allow change of IOPL & IF here,
-                            //        disallow in many other places
-                            // Don't clear high EFLAGS word (is this right??)
-                            flags = cpu.popStack(2);
-
-                            registers.flags.set(flags);
-                        } else {
-                            registers.eip.set(cpu.popStack(4));
-                            // Yes, we must pop 32 bits but discard high word
-                            registers.cs.set(cpu.popStack(4));
-                            eflags = cpu.popStack(4);
-
-                            // VIF, VIP, VM unchanged
-                            // FIXME: What is 0x1A0000 mask for? Can't remember...
-                            registers.eflags.set((eflags & 0x257FD5) | (registers.eflags.get() & 0x1A0000));
-                        }
+                        cpu.interruptReturn(is32);
                     },
 
                     popStack: function (length) {
                         return cpu.popStack(length);
+                    },
+
+                    purgeAllPages: function () {
+                        cpu.purgeAllPages();
                     },
 
                     pushStack: function (value, length) {
@@ -475,6 +548,9 @@ define([
                 registers.fs,
                 registers.gs,
 
+                registers.tr,
+                registers.tdr,
+
                 registers.cf,
                 registers.pf,
                 registers.af,
@@ -497,7 +573,46 @@ define([
 
     util.extend(CPU.prototype, {
         cycle: function () {
+            var cpu = this,
+                useRecompiler = true;
+
+            if (useRecompiler) {
+                cpu.cycleWithRecompiler();
+            } else {
+                cpu.cycleWithInterpreter();
+            }
+        },
+
+        updateStats: function (instructionsThisSlice, fragmentMissesThisSlice, fragmentHitsThisSlice) {
+            var cpu = this;
+
+            // Benchmarking
+            cpu.stats.yieldsPerSecond++;
+            cpu.stats.instructionsPerSecond += instructionsThisSlice;
+            cpu.stats.fragmentHitsPerSecond += fragmentHitsThisSlice;
+            cpu.stats.fragmentMissesPerSecond += fragmentMissesThisSlice;
+
+            if (cpu.clock.getMicrosecondsNow() > (cpu.stats.microsecondsLastUpdate + 1000000) || !cpu.running) {
+                if (util.global.document) {
+                    (util.global.document.getElementById("performance") || {}).textContent =
+                        "insns/sec: " + cpu.stats.instructionsPerSecond + ", " +
+                        "yields/sec: " + cpu.stats.yieldsPerSecond + ", " +
+                        "jit frag hits/sec: " + cpu.stats.fragmentHitsPerSecond + ", " +
+                        "jit frag misses/sec: " + cpu.stats.fragmentMissesPerSecond +
+                        " :: " + (cpu.running ? "RUNNING" : "HALTED");
+
+                    cpu.stats.fragmentHitsPerSecond = 0;
+                    cpu.stats.fragmentMissesPerSecond = 0;
+                    cpu.stats.instructionsPerSecond = 0;
+                    cpu.stats.yieldsPerSecond = 0;
+                    cpu.stats.microsecondsLastUpdate = cpu.clock.getMicrosecondsNow();
+                }
+            }
+        },
+
+        cycleWithInterpreter: function () {
             /*global Uint8Array */
+            /*jshint bitwise: false */
             var cpu = this,
                 endOfSliceMicroseconds = cpu.clock.getMicrosecondsNow() + cpu.timeSliceDurationMicroseconds,
                 legacyCPU = cpu.legacyCPU,
@@ -508,9 +623,13 @@ define([
                 instruction,
                 instructionsThisSlice = 0,
                 is32Bit,
+                linearOffset,
                 memoryBufferDataView,
                 memoryBufferByteView,
-                offset;
+                offset,
+                page,
+                pages = cpu.pages,
+                physicalOffset;
 
             if (cpu.running) {
                 memoryBufferDataView = cpu.memory.getView();
@@ -521,12 +640,49 @@ define([
                 is32Bit = cs.cache.default32BitSize;
                 ip = is32Bit ? registers.eip : registers.ip;
                 offset = ip.get();
-                instruction = decoder.decode(memoryBufferByteView, cs.cache.base + offset, is32Bit);
+
+                linearOffset = cs.cache.base + offset;
+
+                physicalOffset = cpu.memory.linearToPhysical(linearOffset);
+
+                page = physicalOffset >>> 8;
+
+                if (!pages[page]) {
+                    pages[page] = [];
+                }
+
+                instruction = pages[page][physicalOffset];
+
+                if (!instruction) {
+                    instruction = decoder.decode(memoryBufferByteView, physicalOffset, is32Bit);
+
+                    pages[page][physicalOffset] = instruction;
+                }
+
+                cpu.currentInstructionOffset = offset;
 
                 // Update (e)ip before executing instruction
                 ip.set(offset + instruction.length);
 
-                instruction.execute(legacyCPU);
+                try {
+                    if (!instruction.execute) {
+                        // Invalid or undefined opcode
+                        cpu.exception(util.UD_EXCEPTION, null);
+                    }
+
+                    instruction.execute(legacyCPU);
+                } catch (error) {
+                    if (error instanceof CPUHalt) {
+                        // CPU has halted - stop
+                        break;
+                    }
+
+                    // Ignore if a CPU exception, as we will have handled it already.
+                    // The failed instruction should be retried on the next cycle
+                    if (!(error instanceof CPUException)) {
+                        throw error;
+                    }
+                }
 
                 /*
                  * Internal total instruction counter for this time slice,
@@ -541,7 +697,7 @@ define([
                  * interrupt (if enabled) is every 244us,
                  * so approx. 4000 times/sec!)
                  */
-                if ((instructionsThisSlice % 100) === 0) {
+                if ((instructionsThisSlice % 5000) === 0) {
                     // Stop CPU loop for this slice if we run out of time
                     if (cpu.clock.getMicrosecondsNow() > endOfSliceMicroseconds) {
                         break;
@@ -552,27 +708,214 @@ define([
             }
 
             // Set timeout to perform next set of CPU cycles after yield
-            cpu.timeout = setTimeout(function () {
-                cpu.cycle();
-            }, cpu.yieldDurationMicroseconds / 1000);
+            cpu.timeout = setImmediate(function () {
+                cpu.timeout = null;
+                cpu.cycleWithInterpreter();
+            });
 
             cpu.handleAsynchronousEvents();
 
-            // Benchmarking
-            cpu.stats.yieldsPerSecond++;
-            cpu.stats.instructionsPerSecond += instructionsThisSlice;
-            if (cpu.clock.getMicrosecondsNow() > (cpu.stats.microsecondsLastUpdate + 1000000) || !cpu.running) {
-                if (util.global.document) {
-                    (util.global.document.getElementById("performance") || {}).textContent =
-                        "insns/sec: " + cpu.stats.instructionsPerSecond + ", " +
-                        "yields/sec: " + cpu.stats.yieldsPerSecond +
-                        " :: " + (cpu.running ? "RUNNING" : "HALTED");
+            cpu.updateStats(instructionsThisSlice, 0, 0);
+        },
 
-                    cpu.stats.instructionsPerSecond = 0;
-                    cpu.stats.yieldsPerSecond = 0;
-                    cpu.stats.microsecondsLastUpdate = cpu.clock.getMicrosecondsNow();
+        cycleWithRecompiler: function () {
+            /*global Uint8Array */
+            /*jshint bitwise: false */
+            var cpu = this,
+                endOfSliceMicroseconds = cpu.clock.getMicrosecondsNow() + cpu.timeSliceDurationMicroseconds,
+                fragmentHitsThisSlice = 0,
+                fragmentMissesThisSlice = 0,
+                legacyCPU = cpu.legacyCPU,
+                registers = cpu.registers,
+                cs = registers.cs,
+                decoder = cpu.decoder,
+                fragment,
+                fragmentOffset,
+                index,
+                ip,
+                instruction,
+                instructions,
+                instructionsThisFragment,
+                instructionsThisSlice = 0,
+                is32Bit,
+                isBranch,
+                linearOffset,
+                memoryBufferDataView,
+                memoryBufferByteView,
+                offset,
+                page,
+                pages = cpu.pages,
+                parts = [],
+                physicalOffset;
+
+            if (cpu.running) {
+                memoryBufferDataView = cpu.memory.getView();
+                memoryBufferByteView = new Uint8Array(memoryBufferDataView.buffer);
+            }
+
+            while (cpu.running) {
+                is32Bit = cs.cache.default32BitSize;
+                ip = is32Bit ? registers.eip : registers.ip;
+                offset = ip.get();
+
+                linearOffset = cs.cache.base + offset;
+
+                physicalOffset = cpu.memory.linearToPhysical(linearOffset);
+
+                page = physicalOffset >>> 8;
+
+                if (!pages[page]) {
+                    pages[page] = [];
+                }
+
+                fragment = pages[page][physicalOffset];
+
+                if (fragment && fragment !== true && fragment.is32Bit !== is32Bit) {
+                    fragment = null;
+                }
+
+                if (!fragment) {
+                    // Instruction has not been run yet; record hit and interpret
+                    pages[page][physicalOffset] = true;
+
+                    instruction = decoder.decode(memoryBufferByteView, physicalOffset, is32Bit);
+
+                    cpu.currentInstructionOffset = offset;
+
+                    // Update (e)ip before executing instruction
+                    ip.set(offset + instruction.length);
+
+                    try {
+                        if (!instruction.execute) {
+                            // Invalid or undefined opcode
+                            cpu.exception(util.UD_EXCEPTION, null);
+                        }
+
+                        instruction.execute(legacyCPU);
+                    } catch (error) {
+                        if (error instanceof CPUHalt) {
+                            // CPU has halted - stop
+                            break;
+                        }
+
+                        // Ignore if a CPU exception, as we will have handled it already.
+                        // The failed instruction should be retried on the next cycle
+                        if (!(error instanceof CPUException)) {
+                            throw error;
+                        }
+                    }
+
+                    instructionsThisFragment = 1;
+                    fragmentMissesThisSlice++;
+                } else {
+                    if (fragment === true) {
+                        // Instruction was previously hit; hot code found - compile!
+                        instructions = [];
+                        parts.length = 0;
+
+                        fragmentOffset = physicalOffset;
+
+                        for (index = 0; index < 128; index++) {
+                            // TODO: When switching to protected mode, make sure the far jump
+                            //       causes the current fragment to be exited.
+                            //       (Clearing the entire fragment cache shouldn't be needed,
+                            //       as caching is done by physical address, and the data there
+                            //       will not change just because PE is set to 1.)
+
+                            instruction = decoder.decode(memoryBufferByteView, fragmentOffset, is32Bit);
+
+                            if (!instruction.execute) {
+                                // Invalid or undefined opcode
+                                cpu.exception(util.UD_EXCEPTION, null);
+                            }
+
+                            instructions[index] = instruction;
+
+                            isBranch = BRANCHING_INSTRUCTIONS[instruction.opcodeData.name];
+
+                            parts.push("cpu.currentInstructionOffset = " + offset + "; ");
+
+                            offset += instruction.length;
+                            fragmentOffset += instruction.length;
+
+                            parts.push("ip.set(" + offset + ");\n");
+                            parts.push("instructions[" + index + "].execute(legacyCPU);\n");
+
+                            if (isBranch) {
+                                index++; // Keep instruction count consistent
+                                break;
+                            }
+                        }
+
+                        /*jshint evil: true */
+                        fragment = new Function(
+                            "cpu, ip, instructions, legacyCPU",
+                            "return function () {\n" + parts.join("") + "};"
+                        )(
+                            cpu,
+                            ip,
+                            instructions,
+                            legacyCPU
+                        );
+                        fragment.instructionCount = index;
+                        fragment.is32Bit = is32Bit;
+
+                        pages[page][physicalOffset] = fragment;
+                        fragmentMissesThisSlice++;
+                    } else {
+                        fragmentHitsThisSlice++;
+                    }
+
+                    try {
+                        fragment();
+                    } catch (error) {
+                        if (error instanceof CPUHalt) {
+                            // CPU has halted - stop
+                            break;
+                        }
+
+                        // Ignore if a CPU exception, as we will have handled it already.
+                        // The failed instruction should be retried on the next cycle
+                        if (!(error instanceof CPUException)) {
+                            throw error;
+                        }
+                    }
+
+                    instructionsThisFragment = fragment.instructionCount;
+                }
+
+                /*
+                 * Internal instruction count stats for this time slice,
+                 * for benchmarking and optimisation
+                 */
+                instructionsThisSlice += instructionsThisFragment;
+
+                /*
+                 * Handle asynchronous events & check for end of slice
+                 * after every so many instructions (otherwise we would only
+                 * check during each yield, so only eg. 30 times/sec - RTC
+                 * interrupt (if enabled) is every 244us,
+                 * so approx. 4000 times/sec!)
+                 */
+                if ((((instructionsThisSlice / 1000) >>> 0) % 5) === 0) { // Roughly every 5000 instructions
+                    // Stop CPU loop for this slice if we run out of time
+                    if (cpu.clock.getMicrosecondsNow() > endOfSliceMicroseconds) {
+                        break;
+                    }
+
+                    cpu.handleAsynchronousEvents();
                 }
             }
+
+            // Set timeout to perform next set of CPU cycles after yield
+            cpu.timeout = setImmediate(function () {
+                cpu.timeout = null;
+                cpu.cycleWithRecompiler();
+            });
+
+            cpu.handleAsynchronousEvents();
+
+            cpu.updateStats(instructionsThisSlice, fragmentMissesThisSlice, fragmentHitsThisSlice);
         },
 
         // Decode one page of instructions (23)
@@ -583,17 +926,31 @@ define([
                 cs = registers.cs,
                 decoder = cpu.decoder,
                 asm = "",
+                linearOffset,
                 memoryBufferDataView = cpu.memory.getView(),
                 memoryBufferByteView = new Uint8Array(memoryBufferDataView.buffer),
                 instruction,
-                ip = is32Bit ? registers.eip : registers.ip;
+                ip = is32Bit ? registers.eip : registers.ip,
+                physicalOffset;
 
             if (offset === undefined) {
                 offset = ip.get();
             }
 
-            for (i = 0; i < 23 && offset <= 0xFFFF; ++i) {
-                instruction = decoder.decode(memoryBufferByteView, cs.cache.base + offset, is32Bit);
+            for (i = 0; i < 23; ++i) {
+                linearOffset = cs.cache.base + offset;
+                physicalOffset = cpu.memory.linearToPhysical(linearOffset);
+
+                try {
+                    instruction = decoder.decode(memoryBufferByteView, physicalOffset, is32Bit);
+                } catch (e) {
+                    instruction = {
+                        length: 1,
+                        toASM: function () {
+                            return "#UNKNOWN";
+                        }
+                    };
+                }
 
                 asm += util.hexify(offset) + ": " + instruction.toASM() + "\n";
 
@@ -603,12 +960,27 @@ define([
             return asm;
         },
 
-        exception: function (vector) {
-            var cpu = this;
+        exception: function (vector, code) {
+            var cpu = this,
+                registers = cpu.registers;
+
+            // Point to the instruction that caused the exception (we'll have jumped past it by now)
+            registers.eip.set(cpu.currentInstructionOffset);
+
+            cpu.interrupt(vector);
+
+            // Push a code if the exception provides one - but never in real mode
+            if (code !== null && registers.pe.get()) {
+                if (typeof code !== 'number') {
+                    throw new Error('Invalid exception code "' + code + '" given');
+                }
+
+                cpu.pushStack(code, 4);
+            }
 
             cpu.emit("exception", vector);
 
-            cpu.interrupt(vector);
+            throw new CPUException(vector, code);
         },
 
         fetchRawDescriptor: function (selector/*, exceptionType*/) {
@@ -708,8 +1080,8 @@ define([
                 decoder = cpu.decoder,
                 promise = new Promise();
 
-            cpu.yieldsPerSecond = 30;
-            cpu.yieldDurationMicroseconds = 0;
+            cpu.yieldsPerSecond = 60;
+            cpu.yieldDurationMicroseconds = 1;
             cpu.timeSliceDurationMicroseconds = (1000000 - cpu.yieldDurationMicroseconds * cpu.yieldsPerSecond) / (cpu.yieldsPerSecond + 1);
 
             decoder.on("pre init", function (args) {
@@ -722,7 +1094,7 @@ define([
                         return this.immed + (this.reg ? this.reg.get() : 0);
                     },
                     readWithPointer = function (offset, size) {
-                        return this.getSegReg().readSegment(this.getPointerAddress(offset), size || this.size);
+                        return this.effectiveSegReg.readSegment(this.getPointerAddress(offset), size || this.size);
                     },
                     writeNonPointer = function (val /*, offset, size*/) {
                         // NB: Must be to a register
@@ -748,8 +1120,39 @@ define([
                         "read": function (offset, size) {
                             var operand = this;
 
-                            operand.read = operand.isPointer ? readWithPointer : readNonPointer;
+                            if (operand.isPointer) {
+                                operand.effectiveSegReg = operand.getSegReg();
+                                operand.read = readWithPointer;
+                            } else {
+                                operand.read = readNonPointer;
+                            }
+
+                            // operand.read = operand.isPointer ? readWithPointer : readNonPointer;
                             return operand.read(offset, size);
+                        },
+                        "readSelectorAndOffset": function (offset, size) {
+                            var operand = this,
+                                result = operand.read(offset, size);
+
+                            if (operand.size < 4) {
+                                throw new Error('Selector and offset requires at least 4 bytes');
+                            }
+
+                            if (operand.size === 4) {
+                                return {
+                                    selector: result >>> 16,
+                                    offset: result & 0xFFFF
+                                };
+                            }
+
+                            // Otherwise must be a 6-byte selector+offset:
+                            return operand.isPointer ? {
+                                selector: result.high16,
+                                offset: result.low32
+                            } : {
+                                selector: this.highImmed,
+                                offset: this.immed
+                            };
                         },
                         "signExtend": function (to) {
                             var operand = this;
@@ -778,8 +1181,23 @@ define([
 
                 // Accessors: lazily set polymorphically on first use
                 args.addSet("read", "partials.operand.read");
+                args.addSet("readSelectorAndOffset", "partials.operand.readSelectorAndOffset");
                 args.addSet("write", "partials.operand.write");
             });
+
+            LegacyExecute.functions["#FPU"] = function () {
+                // No FPU support yet
+                console.log('FPU instruction - ' + this.getName());
+
+                if (cpu.registers.em.get()) {
+                    cpu.exception(0x06, null);
+                    // return;
+                }
+
+                // TODO: Figure out when this should be raised - when a certain flag is set in CR0?
+                // (See http://wiki.osdev.org/Exceptions#Device_Not_Available)
+                // cpu.exception(0x07, null);
+            };
 
             decoder.on("post init", function (args) {
                 util.each(args.opcodeMap, function (opcodeData) {
@@ -793,55 +1211,55 @@ define([
 
             decoder.init();
 
-            cpu.timeout = setTimeout(function () {
-                cpu.cycle();
-            });
-
             return promise.resolve();
         },
 
         interrupt: function (vector) {
+            /*jshint bitwise: false */
             var cpu = this,
                 registers = cpu.registers,
                 idtr = registers.idtr,
+                ipSize = registers.pe.get() ? 4 : 2,
+                descriptorSize = ipSize * 2,
             // Calc offset as 4 bytes for every vector before this one
-                offset = vector * 4,
+                tableOffset = vector * descriptorSize,
                 newCS,
                 newIP;
 
             cpu.emit("interrupt", vector);
             cpu.running = true;
 
-            /*if (vector === 0x10) {
-                // AH=0x13
-                // cpu.system.read({as: 'string', from: cpu.registers.es.cache.base + cpu.registers.bp.get(), size: cpu.registers.cx.get()})
-                if (cpu.registers.ah.get() === 0x13) {
-                    //debugger;
-                    console.log(cpu.system.read({as: 'string', from: cpu.registers.es.cache.base + cpu.registers.bp.get(), size: cpu.registers.cx.get()}));
-                }
-            }*/
-
             // Check whether vector is out of bounds (vector being read
             //    must be inside IDTR - its size is variable)
-            if ((offset + 3) > idtr.limit) {
+            if ((tableOffset + descriptorSize - 1) > idtr.limit) {
                 util.problem("CPU.interrupt() :: Error - interrupt vector is outside IDT limit");
                 cpu.exception(util.GP_EXCEPTION, 0);
             }
 
-            // Save current FLAGS and CS:IP (CPU state) on stack
-            cpu.pushStack(registers.flags.get(), 2);
-            cpu.pushStack(registers.cs.get(), 2);
-            cpu.pushStack(registers.ip.get(), 2);
+            // Save current (E)FLAGS and CS:(E)IP (CPU state) on stack
+            cpu.pushStack(registers.eflags.get(), ipSize);
+            cpu.pushStack(registers.cs.get(), ipSize);
+            cpu.pushStack(registers.eip.get(), ipSize);
 
             // Get ISR's IP (& check it is within code segment limits)
-            newIP = cpu.memory.readLinear(idtr.base + offset, 2, 0);
-            if (newIP > registers.cs.cache.limitScaled) {
-                util.problem("CPU.interrupt() :: Error - interrupt vector is outside IDT limit");
-                cpu.exception(util.GP_EXCEPTION, 0);
+            if (registers.pe.get()) {
+                // Read lower 2 bytes of offset
+                newIP = cpu.memory.readLinear(idtr.base + tableOffset, 2, 0);
+
+                // Read upper 2 bytes of offset
+                newIP |= ((cpu.memory.readLinear(idtr.base + tableOffset + 6, 2, 0)) << 16) >>> 0;
+            } else {
+                newIP = cpu.memory.readLinear(idtr.base + tableOffset, 2, 0);
             }
 
+            // FIXME
+            /*if (newIP > registers.cs.cache.limitScaled) {
+                util.problem("CPU.interrupt() :: Error - interrupt vector is outside IDT limit");
+                cpu.exception(util.GP_EXCEPTION, 0);
+            }*/
+
             // Get ISR's CS
-            newCS = cpu.memory.readLinear(idtr.base + offset + 2, 2, 0);
+            newCS = cpu.memory.readLinear(idtr.base + tableOffset + 2, 2, 0);
 
             // Jump to ISR CS:IP
             registers.cs.set(newCS);
@@ -849,8 +1267,88 @@ define([
 
             registers.if.clear(); // Disable any maskable interrupts
             registers.tf.clear(); // Disable any traps
-            registers.ac.clear(); // ???
-            registers.rf.clear();
+            /*registers.ac.clear(); // ???
+            registers.rf.clear();*/
+        },
+
+        // Return from Interrupt Service Routine (ISR)
+        interruptReturn: function (is32) {
+            /*jshint bitwise: false */
+            var cpu = this,
+                eflags,
+                flags,
+                registers = cpu.registers,
+                tssBase;
+
+            if (!is32) {
+                // Set all of EIP to zero-out high word
+                registers.eip.set(cpu.popStack(2));
+                registers.cs.set(cpu.popStack(2)); // 16-bit pop
+
+                // FIXME: Allow change of IOPL & IF here,
+                //        disallow in many other places
+                // Don't clear high EFLAGS word (is this right??)
+                flags = cpu.popStack(2);
+
+                registers.flags.set(flags);
+            } else {
+                // FIXME: Try not popping from the stack until the CS load is successful,
+                //        in case a CPU exception is raised leaving the registers in an odd state (?)
+
+                if (registers.pe.get() && registers.nt.get()) {
+                    // Return from nested task
+                    // TODO: Check for v8086 mode (?)
+
+                    // TODO: Should TR be set to the old value again?
+                    registers.tdr.set(cpu.memory.readLinear(registers.tr.base, 2));
+
+                    if (!registers.tdr.cache.isBusyTSSDescriptor()) {
+                        // Not a TSS descriptor OR it is but is not marked Busy
+                        cpu.exception(util.TS_EXCEPTION, registers.tdr.get());
+                    }
+
+                    // TODO: Additional checks on target TSS
+
+                    registers.tr.set(registers.tdr.get());
+
+                    // Restore calling task's register state
+                    tssBase = registers.tr.cache.base;
+                    registers.eip.set(cpu.memory.readLinear(tssBase + 0x20, 4));
+                    registers.eflags.set(cpu.memory.readLinear(tssBase + 0x24, 4));
+                    registers.eax.set(cpu.memory.readLinear(tssBase + 0x28, 4));
+                    registers.ecx.set(cpu.memory.readLinear(tssBase + 0x2C, 4));
+                    registers.edx.set(cpu.memory.readLinear(tssBase + 0x30, 4));
+                    registers.ebx.set(cpu.memory.readLinear(tssBase + 0x34, 4));
+                    registers.esp.set(cpu.memory.readLinear(tssBase + 0x38, 4));
+                    registers.ebp.set(cpu.memory.readLinear(tssBase + 0x3C, 4));
+                    registers.esi.set(cpu.memory.readLinear(tssBase + 0x40, 4));
+                    registers.edi.set(cpu.memory.readLinear(tssBase + 0x44, 4));
+
+                    registers.es.set(cpu.memory.readLinear(tssBase + 0x48, 2));
+                    registers.cs.set(cpu.memory.readLinear(tssBase + 0x4C, 2));
+                    registers.ss.set(cpu.memory.readLinear(tssBase + 0x50, 2));
+                    registers.ds.set(cpu.memory.readLinear(tssBase + 0x54, 2));
+                    registers.fs.set(cpu.memory.readLinear(tssBase + 0x58, 2));
+                    registers.gs.set(cpu.memory.readLinear(tssBase + 0x5C, 2));
+
+                    // Mark target (called) TSS segment descriptor as no longer busy
+                    var offset = registers.gdtr.base + registers.tr.selector.index * 8;
+                    var byte5 = cpu.memory.readLinear(offset + 5, 1);
+                    byte5 &= ~2; // Clear second bit (Busy bit)
+                    cpu.memory.writeLinear(offset + 5, byte5, 1);
+
+                    return;
+                }
+
+                registers.eip.set(cpu.popStack(4));
+                // Yes, we must pop 32 bits but discard high word
+                registers.cs.set(cpu.popStack(4));
+                eflags = cpu.popStack(4);
+
+                // VIF, VIP, VM unchanged
+                // FIXME: What is 0x1A0000 mask for? Can't remember...
+                registers.eflags.set((eflags & 0x257FD5) | (registers.eflags.get() & 0x1A0000));
+            }
         },
 
         lowerINTR: function () {
@@ -882,6 +1380,15 @@ define([
             sp.set(ptrStack);
 
             return res;
+        },
+
+        purgeAllPages: function () {
+            this.pages = [];
+        },
+
+        purgePage: function (page) {
+            //this.pages[page].length = 0;
+            this.pages[page] = [];
         },
 
         // Push data onto the Stack
@@ -994,6 +1501,14 @@ define([
                 cpu.emit("run");
             }
 
+            if (cpu.timeout === null) {
+                // Start the Fetch-Decode-Execute process if we stopped (vs. just a halt) for some reason
+                cpu.timeout = setImmediate(function () {
+                    cpu.timeout = null;
+                    cpu.cycle();
+                });
+            }
+
             return promise;
         },
 
@@ -1007,7 +1522,21 @@ define([
 
                 // (NB: This may set INTR with the next interrupt)
                 vector = cpu.system.acknowledgeInterrupt();
-                cpu.interrupt(vector);
+
+                try {
+                    cpu.interrupt(vector);
+                } catch (error) {
+                    if (error instanceof CPUHalt) {
+                        // CPU has halted - don't restart it again
+                        return true;
+                    }
+
+                    // Ignore if a CPU exception, as we will have handled it already.
+                    // The failed instruction should be retried on the next cycle
+                    if (!(error instanceof CPUException)) {
+                        throw error;
+                    }
+                }
 
                 // An enabled interrupt will wake the CPU if halted
                 cpu.running = true;
@@ -1021,7 +1550,8 @@ define([
         stop: function () {
             var cpu = this;
 
-            clearTimeout(cpu.timeout);
+            clearImmediate(cpu.timeout);
+            cpu.pages.length = 0;
             cpu.timeout = null;
             cpu.running = false;
         }
